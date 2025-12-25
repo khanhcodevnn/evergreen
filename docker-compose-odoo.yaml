@@ -1,0 +1,95 @@
+version: "3.9"
+
+networks:
+  odoo_net: {}
+  front_net:
+    external: true
+
+services:
+  fixperm_odoo:
+    image: odoo:18.0
+    user: root
+    volumes:
+      - ./data_dir:/var/lib/odoo
+      - ./addons_path:/mnt/extra-addons
+      - ./config:/etc/odoo
+    command: >
+      bash -lc "set -e;
+        install -d -m 755 -o odoo -g odoo /var/lib/odoo/sessions /var/lib/odoo/filestore;
+        chown -R odoo:odoo /var/lib/odoo /mnt/extra-addons /etc/odoo || true;
+        chmod -R 755 /var/lib/odoo /mnt/extra-addons /etc/odoo || true"
+    restart: "no"
+    networks: [odoo_net]
+
+  fixperm_pg:
+    image: postgres:17
+    user: root
+    volumes:
+      - ./pg_data:/var/lib/postgresql/data
+    command: >
+      bash -lc "set -e;
+        mkdir -p /var/lib/postgresql/data;
+        chown -R postgres:postgres /var/lib/postgresql/data;
+        chmod -R go-rwx /var/lib/postgresql/data"
+    restart: "no"
+    networks: [odoo_net]
+
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: odoo
+      POSTGRES_DB: postgres
+      POSTGRES_PASSWORD_FILE: /run/secrets/pgpass
+    volumes:
+      - ./pg_data:/var/lib/postgresql/data
+      - ./secrets/pgpass:/run/secrets/pgpass:ro
+    depends_on:
+      fixperm_pg:
+        # Nâng cấp: Đợi fix quyền xong hoàn toàn mới chạy DB
+        condition: service_completed_successfully
+    restart: unless-stopped
+    networks: [odoo_net]
+    # Nâng cấp: Giới hạn Log để không đầy ổ cứng
+    logging: &logging-opt
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Nâng cấp: Kiểm tra xem DB đã thực sự nhận kết nối chưa
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U odoo"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  odoo:
+    image: odoo:18.0
+    environment:
+      HOST: db
+      PORT: "5432"
+      USER: odoo
+      PASSWORD_FILE: /run/secrets/pgpass
+    ports:
+      - "8069:8069"
+    volumes:
+      - ./data_dir:/var/lib/odoo
+      - ./addons_path:/mnt/extra-addons
+      - ./config:/etc/odoo:ro
+      - ./secrets/pgpass:/run/secrets/pgpass:ro
+    depends_on:
+      fixperm_odoo:
+        # Nâng cấp: Đợi fix quyền xong hoàn toàn
+        condition: service_completed_successfully
+      db:
+        # Nâng cấp: Đợi DB báo "Healthy" (sẵn sàng) mới chạy Odoo
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [odoo_net, front_net]
+    # Nâng cấp: Giới hạn Log
+    logging: *logging-opt
+    # Nâng cấp: Kiểm tra xem Odoo Web đã chạy chưa
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8069/web/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
